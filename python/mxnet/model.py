@@ -28,7 +28,7 @@ from collections import namedtuple
 import numpy as np
 
 from . import io
-from . import nd
+from . import ndarray as nd
 from . import symbol as sym
 from . import optimizer as opt
 from . import metric
@@ -55,6 +55,30 @@ BatchEndParam = namedtuple('BatchEndParams',
                             'eval_metric',
                             'locals'])
 
+def _create_sparse_kvstore(kvstore):
+    """Create kvstore assuming some parameters' storage types are row_sparse.
+
+    Parameters
+    ----------
+    kvstore : KVStore or str
+        The kvstore.
+
+    Returns
+    -------
+    kvstore : KVStore
+    update_on_kvstore : bool. Always True.
+    """
+    # always update on kvstore
+    update_on_kvstore = True
+    if isinstance(kvstore, kvs.KVStore):
+        kv = kvstore
+    elif isinstance(kvstore, str):
+        kv = kvs.create(kvstore)
+    else:
+        raise TypeError("Cannot create '%s' KVStore with row_sparse parameters. "
+                        "The type must be KVStore or str." % kvstore)
+    return (kv, update_on_kvstore)
+
 def _create_kvstore(kvstore, num_device, arg_params):
     """Create kvstore
     This function select and create a proper kvstore if given the kvstore type.
@@ -68,14 +92,14 @@ def _create_kvstore(kvstore, num_device, arg_params):
     arg_params : dict of str to `NDArray`.
         Model parameter, dict of name to `NDArray` of net's weights.
     """
-    update_on_kvstore = True
+    update_on_kvstore = bool(int(os.getenv('MXNET_UPDATE_ON_KVSTORE', "1")))
     if kvstore is None:
         kv = None
     elif isinstance(kvstore, kvs.KVStore):
         kv = kvstore
     elif isinstance(kvstore, str):
         # create kvstore using the string type
-        if num_device is 1 and 'dist' not in kvstore:
+        if num_device == 1 and 'dist' not in kvstore:
             # no need to use kv for single device and single machine
             kv = None
         else:
@@ -113,7 +137,7 @@ def _update_params_on_kvstore_nccl(param_arrays, grad_arrays, kvstore, param_nam
     size = len(valid_grad_arrays)
     start = 0
     # Use aggregation by default only with NCCL
-    default_batch = 16
+    default_batch = '16'
     batch = int(os.getenv('MXNET_UPDATE_AGGREGATION_SIZE', default_batch))
     while start < size:
         end = start + batch if start + batch < size else size
@@ -138,6 +162,7 @@ def _update_params_on_kvstore(param_arrays, grad_arrays, kvstore, param_names):
 def _update_params(param_arrays, grad_arrays, updater, num_device,
                    kvstore=None, param_names=None):
     """Perform update of param_arrays from grad_arrays not on kvstore."""
+    updates = [[] for _ in range(num_device)]
     for i, pair in enumerate(zip(param_arrays, grad_arrays)):
         arg_list, grad_list = pair
         if grad_list[0] is None:
@@ -154,7 +179,12 @@ def _update_params(param_arrays, grad_arrays, updater, num_device,
             # state for the same index but on diff devs, TODO(mli)
             # use a better solution later
             w, g = p
-            updater(index*num_device+k, g, w)
+            updates[k].append((index*num_device+k, g, w))
+    for dev_updates in updates:
+        # update params if param_arrays and grad_arrays are not empty
+        if dev_updates:
+            i, w, g = zip(*dev_updates)
+            updater(i, w, g)
 
 
 def _multiple_callbacks(callbacks, *args, **kwargs):
@@ -253,6 +283,8 @@ def _train_multi_device(symbol, ctx, arg_names, param_names, aux_names,
 
     if not update_on_kvstore:
         updater = get_updater(optimizer)
+    else:
+        kvstore.set_optimizer(optimizer)
 
     if kvstore:
         _initialize_kvstore(kvstore=kvstore,
@@ -260,9 +292,6 @@ def _train_multi_device(symbol, ctx, arg_names, param_names, aux_names,
                             arg_params=arg_params,
                             param_names=executor_manager.param_names,
                             update_on_kvstore=update_on_kvstore)
-
-    if update_on_kvstore:
-        kvstore.set_optimizer(optimizer)
 
     # Now start training
     train_data.reset()
@@ -360,10 +389,9 @@ def _train_multi_device(symbol, ctx, arg_names, param_names, aux_names,
                 _multiple_callbacks(eval_end_callback, eval_end_params)
             eval_data.reset()
     # end of all epochs
-    return
 
 
-def save_checkpoint(prefix, epoch, symbol, arg_params, aux_params):
+def save_checkpoint(prefix, epoch, symbol, arg_params, aux_params, remove_amp_cast=True):
     """Checkpoint the model data into file.
 
     Parameters
@@ -378,13 +406,15 @@ def save_checkpoint(prefix, epoch, symbol, arg_params, aux_params):
         Model parameter, dict of name to NDArray of net's weights.
     aux_params : dict of str to NDArray
         Model parameter, dict of name to NDArray of net's auxiliary states.
+    remove_amp_cast : bool, optional
+        Whether to remove the amp_cast and amp_multicast operators, before saving the model.
     Notes
     -----
     - ``prefix-symbol.json`` will be saved for symbol.
     - ``prefix-epoch.params`` will be saved for parameters.
     """
     if symbol is not None:
-        symbol.save('%s-symbol.json' % prefix)
+        symbol.save('%s-symbol.json' % prefix, remove_amp_cast=remove_amp_cast)
 
     save_dict = {('arg:%s' % k) : v.as_in_context(cpu()) for k, v in arg_params.items()}
     save_dict.update({('aux:%s' % k) : v.as_in_context(cpu()) for k, v in aux_params.items()})
@@ -592,15 +622,17 @@ class FeedForward(BASE_ESTIMATOR):
 
     def _init_predictor(self, input_shapes, type_dict=None):
         """Initialize the predictor module for running prediction."""
+        shapes = {name: self.arg_params[name].shape for name in self.arg_params}
+        shapes.update(dict(input_shapes))
         if self._pred_exec is not None:
-            arg_shapes, _, _ = self.symbol.infer_shape(**dict(input_shapes))
+            arg_shapes, _, _ = self.symbol.infer_shape(**shapes)
             assert arg_shapes is not None, "Incomplete input shapes"
             pred_shapes = [x.shape for x in self._pred_exec.arg_arrays]
             if arg_shapes == pred_shapes:
                 return
         # for now only use the first device
         pred_exec = self.symbol.simple_bind(
-            self.ctx[0], grad_req='null', type_dict=type_dict, **dict(input_shapes))
+            self.ctx[0], grad_req='null', type_dict=type_dict, **shapes)
         pred_exec.copy_params_from(self.arg_params, self.aux_params)
 
         _check_arguments(self.symbol)
@@ -610,7 +642,7 @@ class FeedForward(BASE_ESTIMATOR):
         """Initialize the iterator given input."""
         if isinstance(X, (np.ndarray, nd.NDArray)):
             if y is None:
-                if is_train:
+                if is_train: # pylint: disable=no-else-raise
                     raise ValueError('y must be specified when X is numpy.ndarray')
                 else:
                     y = np.zeros(X.shape[0])
@@ -848,12 +880,14 @@ class FeedForward(BASE_ESTIMATOR):
         # init optmizer
         if isinstance(self.optimizer, str):
             batch_size = data.batch_size
-            if kvstore and 'dist' in kvstore.type and not '_async' in kvstore.type:
+            if kvstore and 'dist' in kvstore.type and '_async' not in kvstore.type:
                 batch_size *= kvstore.num_workers
             optimizer = opt.create(self.optimizer,
                                    rescale_grad=(1.0/batch_size),
                                    **(self.kwargs))
         elif isinstance(self.optimizer, opt.Optimizer):
+            if not optimizer.idx2name:
+                optimizer.idx2name = param_idx2name.copy()
             optimizer = self.optimizer
 
         # do training
@@ -873,7 +907,7 @@ class FeedForward(BASE_ESTIMATOR):
                             sym_gen=self.sym_gen)
 
 
-    def save(self, prefix, epoch=None):
+    def save(self, prefix, epoch=None, remove_amp_cast=True):
         """Checkpoint the model checkpoint into file.
         You can also use `pickle` to do the job if you only work on Python.
         The advantage of `load` and `save` (as compared to `pickle`) is that
@@ -884,6 +918,8 @@ class FeedForward(BASE_ESTIMATOR):
         ----------
         prefix : str
             Prefix of model name.
+        remove_amp_cast : bool, optional
+            Whether to remove the amp_cast and amp_multicast operators, before saving the model.
 
         Notes
         -----
@@ -893,7 +929,7 @@ class FeedForward(BASE_ESTIMATOR):
         if epoch is None:
             epoch = self.num_epoch
         assert epoch is not None
-        save_checkpoint(prefix, epoch, self.symbol, self.arg_params, self.aux_params)
+        save_checkpoint(prefix, epoch, self.symbol, self.arg_params, self.aux_params, remove_amp_cast=remove_amp_cast)
 
     @staticmethod
     def load(prefix, epoch, ctx=None, **kwargs):

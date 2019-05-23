@@ -17,9 +17,10 @@
 
 # pylint: disable=unused-import
 """Register backend ops in mxnet.symbol namespace."""
+from __future__ import absolute_import
 import os as _os
 import ctypes
-import numpy as np
+import numpy as _np
 
 from . import _internal
 from ._internal import SymbolBase, _symbol_creator
@@ -109,13 +110,17 @@ def %s(*%s, **kwargs):"""%(func_name, arr_name))
             if dtype_name is not None:
                 code.append("""
     if '%s' in kwargs:
-        kwargs['%s'] = np.dtype(kwargs['%s']).name"""%(
+        kwargs['%s'] = _np.dtype(kwargs['%s']).name"""%(
             dtype_name, dtype_name, dtype_name))
             code.append("""
     attr = kwargs.pop('attr', None)
-    kwargs.update(AttrScope.current.get(attr))
+    if not hasattr(AttrScope._current, "value"):
+        AttrScope._current.value = AttrScope()
+    kwargs.update(AttrScope._current.value.get(attr))
     name = kwargs.pop('name', None)
-    name = NameManager.current.get(name, '%s')
+    if not hasattr(NameManager._current, "value"):
+        NameManager._current.value = NameManager()
+    name = NameManager._current.value.get(name, '%s')
     _ = kwargs.pop('out', None)
     keys = []
     vals = []
@@ -126,7 +131,7 @@ def %s(*%s, **kwargs):"""%(func_name, arr_name))
         else:
             keys.append(k)
             vals.append(v)"""%(func_name.lower()))
-            if key_var_num_args:
+            if key_var_num_args: # pylint: disable=using-constant-test
                 code.append("""
     if '%s' not in kwargs:
         keys.append('%s')
@@ -141,7 +146,9 @@ def %s(*%s, **kwargs):"""%(func_name, arr_name))
 def %s(%s):"""%(func_name, ', '.join(signature)))
         if not signature_only:
             code.append("""
-    kwargs.update(AttrScope.current.get(attr))
+    if not hasattr(AttrScope._current, "value"):
+        AttrScope._current.value = AttrScope()
+    kwargs.update(AttrScope._current.value.get(attr))
     sym_kwargs = dict()
     _keys = []
     _vals = []
@@ -169,10 +176,12 @@ def %s(%s):"""%(func_name, ', '.join(signature)))
                 code.append("""
     if %s is not _Null:
         _keys.append('%s')
-        _vals.append(np.dtype(%s).name)"""%(dtype_name, dtype_name, dtype_name))
+        _vals.append(_np.dtype(%s).name)"""%(dtype_name, dtype_name, dtype_name))
 
             code.append("""
-    name = NameManager.current.get(name, '%s')
+    if not hasattr(NameManager._current, "value"):
+        NameManager._current.value = NameManager()
+    name = NameManager._current.value.get(name, '%s')
     return _symbol_creator(%d, None, sym_kwargs, _keys, _vals, name)"""%(
         func_name.lower(), handle.value))
 
@@ -200,3 +209,14 @@ def _make_symbol_function(handle, name, func_name):
     return symbol_function
 
 _init_op_module('mxnet', 'symbol', _make_symbol_function)
+
+# Update operator documentation with added float support
+# Note that we can only do this after the op module is initialized
+# Otherwise the backend operators cannot be found
+# pylint: disable=wrong-import-position
+from .contrib import adamw_update, mp_adamw_update
+from ._internal import _adamw_update, _mp_adamw_update
+adamw_update.__doc__ = _adamw_update.__doc__.replace("rescale_grad : Symbol",
+                                                     "rescale_grad : Symbol or float")
+mp_adamw_update.__doc__ = _mp_adamw_update.__doc__.replace("rescale_grad : Symbol",
+                                                           "rescale_grad : Symbol or float")

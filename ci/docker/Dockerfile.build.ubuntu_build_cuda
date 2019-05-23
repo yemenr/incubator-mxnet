@@ -21,37 +21,44 @@
 # package generation, requiring the actual CUDA library to be
 # present
 
-FROM nvidia/cuda:8.0-cudnn5-devel
-
-ARG USER_ID=0
+FROM nvidia/cuda:10.0-devel-ubuntu16.04
 
 WORKDIR /work/deps
 
 COPY install/ubuntu_core.sh /work/
 RUN /work/ubuntu_core.sh
+COPY install/deb_ubuntu_ccache.sh /work/
+RUN /work/deb_ubuntu_ccache.sh
 COPY install/ubuntu_python.sh /work/
 RUN /work/ubuntu_python.sh
 COPY install/ubuntu_scala.sh /work/
+COPY install/sbt.gpg /work/
 RUN /work/ubuntu_scala.sh
 COPY install/ubuntu_r.sh /work/
+COPY install/r.gpg /work/
 RUN /work/ubuntu_r.sh
 COPY install/ubuntu_perl.sh /work/
 RUN /work/ubuntu_perl.sh
-COPY install/ubuntu_lint.sh /work/
-RUN /work/ubuntu_lint.sh
 COPY install/ubuntu_clang.sh /work/
 RUN /work/ubuntu_clang.sh
 COPY install/ubuntu_mklml.sh /work/
 RUN /work/ubuntu_mklml.sh
-COPY install/ubuntu_adduser.sh /work/
-RUN /work/ubuntu_adduser.sh
+
+ENV CUDNN_VERSION=7.5.1.10
+COPY install/ubuntu_cudnn.sh /work/
+RUN /work/ubuntu_cudnn.sh
 
 # Special case because the CPP-Package requires the CUDA runtime libs
-# and not only stubs..
+# and not only stubs (which are provided by the base image)
 COPY install/ubuntu_nvidia.sh /work/
 RUN /work/ubuntu_nvidia.sh
+
+# Keep this at the end since this command is not cachable
+ARG USER_ID=0
+ARG GROUP_ID=0
+COPY install/ubuntu_adduser.sh /work/
+RUN /work/ubuntu_adduser.sh
 
 COPY runtime_functions.sh /work/
 
 WORKDIR /work/mxnet
-ENV LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:/usr/local/lib

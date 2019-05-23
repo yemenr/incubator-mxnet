@@ -27,7 +27,6 @@
 namespace mxnet {
 namespace storage {
 
-#if MXNET_USE_PROFILER
 /*!
  * \brief Storage allocation/deallocation profiling via ProfileCounters
  */
@@ -67,7 +66,11 @@ class DeviceStorageProfiler {
         Init();  // In case of bug which tries to free first
         const size_t idx = prof->DeviceIndex(handle.ctx.dev_type, handle.ctx.dev_id);
         CHECK_LT(idx, mem_counters_.size()) << "Invalid device index: " << idx;
-        *mem_counters_[idx] -= handle.size;
+        if (*mem_counters_[idx] >= handle.size) {
+            *mem_counters_[idx] -= handle.size;
+        } else {
+            *mem_counters_[idx] = 0;
+        }
       }
     }
   }
@@ -102,8 +105,6 @@ class DeviceStorageProfiler {
   /*! \brief Constant-sized vector of memory profile counters */
   std::vector<std::shared_ptr<profiler::ProfileCounter>> mem_counters_;
 };
-
-#endif  // MXNET_USE_PROFILER
 
 }  // namespace storage
 }  // namespace mxnet

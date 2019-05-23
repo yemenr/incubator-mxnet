@@ -19,6 +19,7 @@
 import logging
 import mxnet as mx
 import numpy as np
+import unittest
 
 def test_tvm_bridge():
     # only enable test if TVM is available
@@ -62,4 +63,5 @@ def test_tvm_bridge():
 
 
 if __name__ == "__main__":
-    test_tvm_bridge()
+    import nose
+    nose.runmodule()

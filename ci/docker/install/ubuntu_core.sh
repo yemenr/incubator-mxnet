@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
@@ -21,22 +21,43 @@
 # the whole docker cache for the image
 
 set -ex
-apt-get update
-apt-get install -y \
-    build-essential \
-    git \
-    libopenblas-dev \
-    liblapack-dev \
-    libopencv-dev \
-    libcurl4-openssl-dev \
-    cmake \
-    wget \
-    unzip \
-    sudo \
-    software-properties-common \
-    ninja-build \
-    python-pip
+apt-get update || true
 
-# Link Openblas to Cblas as this link does not exist on ubuntu16.04
-ln -s /usr/lib/libopenblas.so /usr/lib/libcblas.so
-pip install cpplint==1.3.0 pylint==1.8.2
+# Avoid interactive package installers such as tzdata.
+export DEBIAN_FRONTEND=noninteractive
+
+apt-get install -y \
+    apt-transport-https \
+    build-essential \
+    ca-certificates \
+    curl \
+    git \
+    libatlas-base-dev \
+    libcurl4-openssl-dev \
+    libjemalloc-dev \
+    libhdf5-dev \
+    liblapack-dev \
+    libopenblas-dev \
+    libopencv-dev \
+    libturbojpeg \
+    libzmq3-dev \
+    ninja-build \
+    software-properties-common \
+    sudo \
+    unzip \
+    vim-nox \
+    wget
+
+# Use libturbojpeg package as it is correctly compiled with -fPIC flag
+# https://github.com/HaxeFoundation/hashlink/issues/147 
+ln -s /usr/lib/x86_64-linux-gnu/libturbojpeg.so.0.1.0 /usr/lib/x86_64-linux-gnu/libturbojpeg.so
+
+
+# Note: we specify an exact cmake version to work around a cmake 3.10 CUDA 10 issue.
+# Reference: https://github.com/clab/dynet/issues/1457
+mkdir /opt/cmake && cd /opt/cmake
+wget -nv https://cmake.org/files/v3.12/cmake-3.12.4-Linux-x86_64.sh
+sh cmake-3.12.4-Linux-x86_64.sh --prefix=/opt/cmake --skip-license
+ln -s /opt/cmake/bin/cmake /usr/local/bin/cmake
+rm cmake-3.12.4-Linux-x86_64.sh
+cmake --version

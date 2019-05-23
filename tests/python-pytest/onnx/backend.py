@@ -16,131 +16,56 @@
 # under the License.
 
 # coding: utf-8
-"""backend wrapper for onnx test infrastructure"""
+"""MXNet/Gluon backend wrapper for onnx test infrastructure"""
+
+from mxnet.contrib.onnx.onnx2mx.import_onnx import GraphProto
+from mxnet.contrib.onnx.mx2onnx.export_onnx import MXNetGraph
 import mxnet as mx
-from mxnet.contrib.onnx._import.import_onnx import GraphProto
+import numpy as np
+
 try:
-    from onnx import helper, TensorProto
+    from onnx import helper, TensorProto, mapping
     from onnx.backend.base import Backend
 except ImportError:
-    raise ImportError("Onnx and protobuf need to be installed")
-from backend_rep import MXNetBackendRep
+    raise ImportError("Onnx and protobuf need to be installed. Instructions to"
+                      + " install - https://github.com/onnx/onnx#installation")
+from backend_rep import MXNetBackendRep, GluonBackendRep
 
-# Using these functions for onnx test infrastructure.
-# Implemented by following onnx docs guide:
-# https://github.com/onnx/onnx/blob/master/docs/Implementing%20an%20ONNX%20backend.md
+
 # MXNetBackend class will take an ONNX model with inputs, perform a computation,
 # and then return the output.
+# Implemented by following onnx docs guide:
+# https://github.com/onnx/onnx/blob/master/docs/ImplementingAnOnnxBackend.md
 
 class MXNetBackend(Backend):
-    """MXNet backend for ONNX"""
+    """MXNet/Gluon backend for ONNX"""
 
-    @staticmethod
-    def make_graph(node, inputs):
-        """ Created ONNX GraphProto from node"""
-        initializer = []
-        tensor_input_info = []
-        tensor_output_info = []
-
-        # Adding input tensor info.
-        for index in range(len(node.input)):
-            tensor_input_info.append(
-                helper.make_tensor_value_info(str(node.input[index]), TensorProto.FLOAT, [1]))
-
-            # Creating an initializer for Weight params.
-            # Assumes that weight params is named as 'W'.
-            if node.input[index] == 'W':
-                dim = inputs[index].shape
-                param_tensor = helper.make_tensor(
-                    name=node.input[index],
-                    data_type=TensorProto.FLOAT,
-                    dims=dim,
-                    vals=inputs[index].flatten())
-
-                initializer.append(param_tensor)
-
-        # Adding output tensor info.
-        for index in range(len(node.output)):
-            tensor_output_info.append(
-                helper.make_tensor_value_info(str(node.output[index]), TensorProto.FLOAT, [1]))
-
-        # creating graph proto object.
-        graph_proto = helper.make_graph(
-            [node],
-            "test",
-            tensor_input_info,
-            tensor_output_info,
-            initializer=initializer)
-
-        return graph_proto
+    backend = 'mxnet'
+    operation = 'import'
 
     @classmethod
-    def run_node(cls, node, inputs, device='CPU'):
-        """Running individual node inference on mxnet engine and
-        return the result to onnx test infrastructure.
+    def set_params(cls, backend, operation):
+        cls.backend = backend
+        cls.operation = operation
 
-        Parameters
-        ----------
-        node   : onnx node object
-            loaded onnx node (individual layer)
-        inputs : numpy array
-            input to run a node on
-        device : 'CPU'
-            device to run a node on
-
-        Returns
-        -------
-        params : numpy array
-            result obtained after running the operator
-        """
+    @staticmethod
+    def perform_import_export(sym, arg_params, aux_params, input_shape):
+        """ Import ONNX model to mxnet model and then export to ONNX model
+            and then import it back to mxnet for verifying the result"""
         graph = GraphProto()
-        sym, _ = graph.from_onnx(MXNetBackend.make_graph(node, inputs))
-        data_names = [i for i in sym.get_internals().list_inputs()]
-        data_shapes = []
-        dim_change_op_types = set(['ReduceMin', 'ReduceMax', 'ReduceMean',
-                                   'ReduceProd', 'ReduceSum', 'Slice', 'Pad',
-                                   'Squeeze', 'Upsample', 'Reshape', 'Conv'])
 
-        # Adding extra dimension of batch_size 1 if the batch_size is different for multiple inputs.
-        for idx, input_name in enumerate(data_names):
-            batch_size = 1
-            if len(inputs) > 1 and len(inputs[idx].shape) < 4 and  \
-                            len(set(x.shape[0] for x in inputs)) != 1:
-                tuples = ((batch_size,), inputs[idx].shape)
-                new_shape = sum(tuples, ())
-                data_shapes.append((input_name, new_shape))
-            else:
-                data_shapes.append((input_name, inputs[idx].shape))
+        params = {}
+        params.update(arg_params)
+        params.update(aux_params)
+        # exporting to onnx graph proto format
+        converter = MXNetGraph()
+        graph_proto = converter.create_onnx_graph_proto(sym, params, in_shape=input_shape,
+                                                        in_type=mapping.NP_TYPE_TO_TENSOR_TYPE[np.dtype('float32')])
 
-        # create module, passing cpu context
-        if device == 'CPU':
-            ctx = mx.cpu()
-        else:
-            raise NotImplementedError("Only CPU context is supported for now")
+        # importing back to MXNET for verifying result.
+        sym, arg_params, aux_params = graph.from_onnx(graph_proto)
 
-        # create a module
-        mod = mx.mod.Module(symbol=sym, data_names=data_names, context=ctx, label_names=None)
-        mod.bind(for_training=False, data_shapes=data_shapes, label_shapes=None)
-
-        # initializing parameters for calculating result of each individual node
-        mod.init_params()
-
-        data_forward = []
-        for idx, input_name in enumerate(data_names):
-            # slice and pad operator tests needs 1 less dimension in forward pass
-            # otherwise it will throw an error.
-            # for squeeze operator, need to retain shape of input as provided
-            val = inputs[idx]
-            if node.op_type in dim_change_op_types:
-                data_forward.append(mx.nd.array(val))
-            else:
-                data_forward.append(mx.nd.array([val]))
-
-        mod.forward(mx.io.DataBatch(data_forward))
-        result = mod.get_outputs()[0].asnumpy()
-        if node.op_type in dim_change_op_types:
-            return [result]
-        return result
+        return sym, arg_params, aux_params
 
     @classmethod
     def prepare(cls, model, device='CPU', **kwargs):
@@ -161,17 +86,38 @@ class MXNetBackend(Backend):
             Returns object of MXNetBackendRep class which will be in turn
             used to run inference on the input model and return the result for comparison.
         """
+        backend = kwargs.get('backend', cls.backend)
+        operation = kwargs.get('operation', cls.operation)
+
         graph = GraphProto()
-        sym, params = graph.from_onnx(model.graph)
-        return MXNetBackendRep(sym, params, device)
+        if device == 'CPU':
+            ctx = mx.cpu()
+        else:
+            raise NotImplementedError("ONNX tests are run only for CPU context.")
+
+        if backend == 'mxnet':
+            sym, arg_params, aux_params = graph.from_onnx(model.graph)
+            if operation == 'export':
+                metadata = graph.get_graph_metadata(model.graph)
+                input_data = metadata['input_tensor_data']
+                input_shape = [data[1] for data in input_data]
+                sym, arg_params, aux_params = MXNetBackend.perform_import_export(sym, arg_params, aux_params,
+                                                                                 input_shape)
+
+            return MXNetBackendRep(sym, arg_params, aux_params, device)
+        elif backend == 'gluon':
+            if operation == 'import':
+                net = graph.graph_to_gluon(model.graph, ctx)
+                return GluonBackendRep(net, device)
+            elif operation == 'export':
+                raise NotImplementedError("Gluon->ONNX export not implemented.")
 
     @classmethod
     def supports_device(cls, device):
         """Supports only CPU for testing"""
         return device == 'CPU'
 
-prepare = MXNetBackend.prepare
 
-run_node = MXNetBackend.run_node
+prepare = MXNetBackend.prepare
 
 supports_device = MXNetBackend.supports_device

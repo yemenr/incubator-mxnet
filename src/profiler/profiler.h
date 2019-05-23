@@ -35,6 +35,7 @@
 #include <array>
 #include "./vtune.h"
 #include "./aggregate_stats.h"
+#include "./nvtx.h"
 
 #if defined(_WIN32) || defined(_WIN64) || defined(__WINDOWS__)
 #include <windows.h>
@@ -299,9 +300,9 @@ class Profiler {
   }
   /*!
    * \brief dump the profile file
-   * \param peform_cleanup Close off the json trace structures (ie last pass)
+   * \param perform_cleanup Close off the json trace structures (ie last pass)
    */
-  void DumpProfile(bool peform_cleanup = true);
+  void DumpProfile(bool perform_cleanup = true);
 
   /*! \return the profiler init time, time unit is microsecond (10^-6) s */
   uint64_t MSHADOW_CINLINE GetInitTime() const {
@@ -391,6 +392,14 @@ class Profiler {
     return aggregate_stats_.get() != nullptr;
   }
 
+  /*!
+   * \brief Whether aggregate stats are currently being recorded
+   * \return true if aggregate stats are currently being recorded
+   */
+  inline bool AggregateRunning() const {
+    return GetState() == kRunning && AggregateEnabled();
+  }
+
  public:
   /*!
    * \brief Constructor
@@ -447,7 +456,7 @@ class Profiler {
   /*! \brief filename to output profile file */
   std::string filename_ = "profile.json";
   /*! \brief profile statistics consist of multiple device statistics */
-  DeviceStats* profile_stat;
+  std::unique_ptr<DeviceStats[]> profile_stat;
   /*! \brief Stats not associated directly with a device */
   DeviceStats  general_stats_;
   /*! \brief Map category -> pid */
@@ -469,7 +478,7 @@ class Profiler {
   /*! \brief Maintain in-memory aggregate stats for print output.
    *  \warning This has a negative performance impact */
   std::shared_ptr<AggregateStats> aggregate_stats_ = nullptr;
-  /*! \brief Asynchronous operation thread lifecycly control object */
+  /*! \brief Asynchronous operation thread lifecycle control object */
   std::shared_ptr<dmlc::ThreadGroup> thread_group_ = std::make_shared<dmlc::ThreadGroup>();
   /* !\brief pids */
   std::unordered_set<uint32_t> process_ids_;
@@ -479,6 +488,12 @@ class Profiler {
 #define VTUNE_ONLY_CODE(...) __VA_ARGS__  /* This is undefined at the bottom of this file */
 #else
 #define VTUNE_ONLY_CODE(...) /* */        /* This is undefined at the bottom of this file */
+#endif
+
+#ifdef MXNET_USE_NVTX
+#define NVTX_ONLY_CODE(...) __VA_ARGS__  /* This is undefined at the bottom of this file */
+#else
+#define NVTX_ONLY_CODE(...) /* */        /* This is undefined at the bottom of this file */
 #endif
 
 /**
@@ -547,7 +562,7 @@ struct ProfileDomain : public ProfileObject {
  */
 struct ProfileCounter : public ProfileObject {
   /*!
-   * \brief Co9nstructor
+   * \brief Constructor
    * \param name Counter name
    * \param domain Counter domain
    */
@@ -600,6 +615,12 @@ struct ProfileCounter : public ProfileObject {
       return IncrementValue(static_cast<uint64_t>(v));
     }
   }
+
+  inline bool operator >=(int64_t v) {
+      CHECK_GE(v, 0);
+      return value_ >= static_cast<uint64_t>(v);
+  }
+
   /*! \brief operator: object = v */
   inline ProfileCounter& operator = (uint64_t v) {
     SetValue(v);
@@ -763,6 +784,7 @@ struct ProfileTask : public ProfileDuration {
     categories_.set(domain_->name());
     categories_.append(",task");
     VTUNE_ONLY_CODE(vtune_task_.reset(new vtune::VTuneTask(name, domain->dom())));
+    NVTX_ONLY_CODE(nvtx_duration_.reset(new nvtx::NVTXDuration(name)));
   }
 
   /*!
@@ -771,6 +793,7 @@ struct ProfileTask : public ProfileDuration {
   void start() override {
     start_time_ = ProfileStat::NowInMicrosec();
     VTUNE_ONLY_CODE(vtune_task_->start());
+    NVTX_ONLY_CODE(nvtx_duration_->start());
   }
 
   /*!
@@ -778,6 +801,7 @@ struct ProfileTask : public ProfileDuration {
    */
   void stop() override {
     VTUNE_ONLY_CODE(vtune_task_->stop());
+    NVTX_ONLY_CODE(nvtx_duration_->stop());
     SendStat();
   }
 
@@ -817,6 +841,8 @@ struct ProfileTask : public ProfileDuration {
   ProfileDomain *domain_;
   /*! \brief VTune task object */
   VTUNE_ONLY_CODE(std::unique_ptr<vtune::VTuneTask> vtune_task_);
+  /*! \brief NVTX duration object */
+  NVTX_ONLY_CODE(std::unique_ptr<nvtx::NVTXDuration> nvtx_duration_);
 
  protected:
   /*! \brief Task's start tick */
@@ -835,6 +861,7 @@ struct ProfileEvent  : public ProfileDuration {
     : name_(name)
       , categories_("event") {
     VTUNE_ONLY_CODE(vtune_event_ = vtune::VTuneEvent::registry_.get(name));
+    NVTX_ONLY_CODE(nvtx_duration_.reset(new nvtx::NVTXDuration(name)));
   }
 
   /*!
@@ -843,6 +870,7 @@ struct ProfileEvent  : public ProfileDuration {
   void start() override {
     start_time_ = ProfileStat::NowInMicrosec();
     VTUNE_ONLY_CODE(vtune_event_->start());
+    NVTX_ONLY_CODE(nvtx_duration_->start());
   }
 
   /*!
@@ -891,6 +919,8 @@ struct ProfileEvent  : public ProfileDuration {
   profile_stat_string categories_;
   /*! \brief VTune event object */
   VTUNE_ONLY_CODE(vtune::VTuneEvent *vtune_event_);
+  /*! \brief NVTX duration object */
+  NVTX_ONLY_CODE(std::unique_ptr<nvtx::NVTXDuration> nvtx_duration_;);
 
  protected:
   /*! \brief Start time of the event */
@@ -912,6 +942,7 @@ struct ProfileFrame : public ProfileDuration {
     CHECK_NOTNULL(domain);
     categories_.set(domain_->name());
     categories_.append(",frame");
+    NVTX_ONLY_CODE(nvtx_duration_.reset(new nvtx::NVTXDuration(name)));
     VTUNE_ONLY_CODE(vtune_frame_.reset(new vtune::VTuneFrame(domain->dom())));
   }
 
@@ -921,6 +952,7 @@ struct ProfileFrame : public ProfileDuration {
   void start() override {
     start_time_ = ProfileStat::NowInMicrosec();
     VTUNE_ONLY_CODE(vtune_frame_->start());
+    NVTX_ONLY_CODE(nvtx_duration_->start());
   }
 
   /*!
@@ -963,6 +995,8 @@ struct ProfileFrame : public ProfileDuration {
   ProfileDomain *domain_;
   /*! \brief VTune Frame object */
   VTUNE_ONLY_CODE(std::unique_ptr<vtune::VTuneFrame> vtune_frame_);
+  /*! \brief NVTX duration object */
+  NVTX_ONLY_CODE(std::unique_ptr<nvtx::NVTXDuration> nvtx_duration_);
 
  protected:
   /*! \brief Frame start time */
@@ -1073,8 +1107,8 @@ struct ProfileOperator : public ProfileEvent {
    * \brief Operator attributes
    */
   struct Attributes {
-    std::vector<nnvm::TShape> inputs_;
-    std::vector<nnvm::TShape> outputs_;
+    std::vector<mxnet::TShape> inputs_;
+    std::vector<mxnet::TShape> outputs_;
     std::unordered_map<std::string, std::string> attr_;
     std::string to_string() const {
       std::stringstream ss;
@@ -1222,7 +1256,7 @@ inline size_t Profiler::DeviceIndex(mxnet::Context::DeviceType dev_type, int32_t
 
 /*!
  * \brief Explicit 'Profiler::AddProfileStat' override for 'OprExecStat'
- * \param opr_stat Unique pointert to the operator statistic
+ * \param opr_stat Unique pointer to the operator statistic
  */
 template<>
 inline void Profiler::AddProfileStat<ProfileOperator::OprExecStat>(
